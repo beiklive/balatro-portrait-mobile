@@ -18,15 +18,21 @@ Options:
                           deprecated alias)
     --readabletro         Apply Readabletro font and high-res texture patch (default)
     --no-readabletro      Skip Readabletro patch
-    --ios                 Also build an iOS .ipa for sideloading (EXPERIMENTAL).
-                          The shell has lovely-injector in it, so Steamodded can
-                          load the same way it does on Android
+    --ios                 Build the iOS .ipa for sideloading (EXPERIMENTAL) and
+                          skip the Android APK. The shell has lovely-injector in
+                          it, so Steamodded can load the same way it does on
+                          Android
     --ios-vanilla         Build that .ipa on the plain LOVE shell instead, with
                           no mod loader
     --no-ios              Skip the iOS build (default)
+    --portrait            Package the portrait layout mod from src/ instead of
+                          the game as it ships
+    --no-portrait         Package the game as it ships: original landscape
+                          layout, no portrait mod (default)
     --balatro PATH        Path to Balatro game file (skips the interactive prompt)
     --skip-setup          Skip resource extraction (if src/resources already exists)
-    --skip-apk            Only build Game.love, skip APK packaging
+    --skip-apk            Only build Game.love, skip APK packaging (--ios implies this)
+    --with-apk            With --ios, package the Android APK as well
     --force               Force Game.love rebuild even if sources are unchanged
     --import-save PATH    Bake a desktop save folder or Takeout zip into the APK
     --steamodded [TAG]    Bundle Steamodded into the APK (default: latest release)
@@ -76,11 +82,22 @@ DEFAULT_BUILD_CONFIG = {
     "crt": False,
     "readabletro": True,
     "ios": False,
+    # Off by default: the build packages the game as it ships. --portrait opts
+    # back into the portrait layout mod in src/.
+    "portrait": False,
 }
 
 WORKDIR  = os.path.abspath("balatro-mobile-maker")
 JDK_DIR  = os.path.join(WORKDIR, "jdk")
 JAVA_BIN = os.path.join(JDK_DIR, "bin", "java")  # resolved after JDK extraction
+
+# Non-portrait (default) builds package game_original_files/ plus this overlay of
+# edits that are not about portrait layout at all. Everything portrait-specific
+# in src/ (the layout patches, portrait_config.lua, smali/, the portrait UI
+# scaling) is deliberately left out, so the default output matches the shipped
+# game. See _stage_vanilla_source().
+MOBILE_OVERLAY_DIR = os.path.join("patches", "mobile")
+VANILLA_SRC_DIR    = os.path.join(WORKDIR, "vanilla-src")
 
 # Termux (building directly on an Android phone): the downloaded desktop JDK
 # and the aapt binaries bundled inside the apktool jar are x86-64 only and
@@ -199,6 +216,19 @@ CRT_NOISE_COMMENTED_LINES = (
 )
 
 GAME_LOVE_EXCLUDE = {"smali", ".pyc", "__pycache__", ".git", ".gitignore", ".bak", ".build_cache.json"}
+
+# The game rebuilds its window once at boot:
+#   love.window.updateMode(w, h, { ..., highdpi = (love.system.getOS() == 'OS X') })
+# updateMode takes whatever flags it is handed, so on iOS this drops the highdpi
+# flag conf.lua asked for. The drawable falls back to point size, the game renders
+# at 390x844 on an iPhone 13 Pro and the OS stretches that over the 1170x2532
+# panel - the whole-game blurriness of #45. The portrait tree carries the iOS arm
+# inline; the vanilla tree gets it applied here, since it sits in a file
+# (functions/button_callbacks.lua) that is mostly portrait work and so cannot be
+# overlaid wholesale. The original parenthesised test is kept byte identical
+# because Steamodded rewrites it for mobile; iOS is appended after it.
+IOS_HIGHDPI_ORIGINAL = "highdpi = (love.system.getOS() == 'OS X')"
+IOS_HIGHDPI_PATCHED  = "highdpi = (love.system.getOS() == 'OS X') or (love.system.getOS() == 'iOS')"
 
 READABLETRO_LUA_PATCHES = {
     "game.lua": [
@@ -560,6 +590,30 @@ def _apply_flame_precision_patch(src_dir):
     print("  Flame shader asks for high precision on mobile GL, with effect() kept at the preamble's precision.")
 
 
+def _apply_ios_highdpi_patch(src_dir):
+    """Keep the iOS native-scale drawable alive across the boot window rebuild.
+
+    Vanilla's boot call is `highdpi = (love.system.getOS() == 'OS X')`, so iOS
+    loses the flag conf.lua set and renders at point resolution stretched over
+    the panel (#45). The portrait tree has the iOS arm inline; this applies the
+    same edit to the vanilla tree at build time.
+    """
+    callbacks = os.path.join(src_dir, "functions", "button_callbacks.lua")
+    if not os.path.exists(callbacks):
+        return
+    with open(callbacks, "r", encoding="utf-8") as f:
+        content = f.read()
+    if IOS_HIGHDPI_PATCHED in content:
+        return
+    if IOS_HIGHDPI_ORIGINAL not in content:
+        print("  Warning: iOS highdpi target not found in button_callbacks.lua - skipping.")
+        return
+    content = content.replace(IOS_HIGHDPI_ORIGINAL, IOS_HIGHDPI_PATCHED, 1)
+    with open(callbacks, "w", encoding="utf-8") as f:
+        f.write(content)
+    print("  iOS native-scale drawable kept across the boot window rebuild (#45).")
+
+
 def _apply_readabletro(src_dir, apply):
     font_src        = os.path.join("patches", "readabletro", "fonts", "TypoQuik-Bold.ttf")
     font_dst        = os.path.join(src_dir, "resources", "fonts", "TypoQuik-Bold.ttf")
@@ -740,18 +794,85 @@ def _resolve_steamodded(flag_value, interactive):
     return ("Steamodded", files)
 
 
-def build_game_love(apply_crt=False, apply_readabletro=False, force=False, import_saves=None, import_mods=None):
-    """Package src/ into Game.love."""
-    src_dir     = "src"
+def _stage_vanilla_source():
+    """Build the source tree for a non-portrait build and return its path.
+
+    The base is game_original_files/ — the game exactly as it was extracted from
+    the user's own copy — and the only file overwritten is conf.lua, which
+    carries fixes that have nothing to do with portrait layout:
+
+      * conf.lua   iOS native-scale drawable (#45), Android accelerometer
+                   gamepad (#44), mod-loader boot screen fit (#44)
+
+    Nothing portrait-specific is copied: not the layout patches, not
+    portrait_config.lua, not smali/.
+
+    src/engine/controller.lua is deliberately NOT overlaid even though its
+    touch-cursor change looks like a plain mobile fix. It only works alongside
+    the touch plumbing portrait adds to src/main.lua, which writes
+    G.CONTROLLER.touch_position.seen on touchpressed/moved/released. Vanilla
+    main.lua has no touch_position at all, so the overlay would leave
+    HID.mouse = false with a cursor parked offscreen that nothing ever moves:
+    the game renders but no touch lands on anything. Keep this overlay free of
+    anything that reads or writes state the portrait tree introduces.
+
+    Staging into WORKDIR rather than zipping the overlay on the fly keeps the
+    readabletro / shader patch steps working on real files, exactly as they do
+    for the portrait tree.
+    """
+    game_files_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "game_original_files")
+    if not os.path.isdir(game_files_dir):
+        print("  ERROR: game_original_files/ not found - run setup_resources first.")
+        sys.exit(1)
+
+    if os.path.exists(VANILLA_SRC_DIR):
+        shutil.rmtree(VANILLA_SRC_DIR)
+    os.makedirs(os.path.dirname(VANILLA_SRC_DIR), exist_ok=True)
+    shutil.copytree(game_files_dir, VANILLA_SRC_DIR)
+
+    staged = 0
+    for root, _, files in os.walk(MOBILE_OVERLAY_DIR):
+        for fn in files:
+            src = os.path.join(root, fn)
+            dst = os.path.join(VANILLA_SRC_DIR, os.path.relpath(src, MOBILE_OVERLAY_DIR))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            staged += 1
+    print(f"  Vanilla source staged ({staged} mobile platform file(s) overlaid).")
+    return VANILLA_SRC_DIR
+
+
+def build_game_love(apply_crt=False, apply_readabletro=False, force=False, import_saves=None, import_mods=None,
+                    portrait=True):
+    """Package the source tree into Game.love.
+
+    portrait=True (--portrait) packages src/, the portrait layout mod, and
+    applies the portrait build-time patches. portrait=False (the default)
+    packages the game as it ships, from _stage_vanilla_source().
+    """
+    if portrait:
+        src_dir = "src"
+    else:
+        src_dir = _stage_vanilla_source()
     output_file = "Game.love"
 
     if not os.path.exists(src_dir):
-        print("  ERROR: src/ not found.")
+        print(f"  ERROR: {src_dir} not found.")
         sys.exit(1)
 
-    if apply_crt:
-        _apply_crt_patch(src_dir, apply=True)
-    _apply_crt_slider_mask_patch(src_dir)
+    if portrait:
+        if apply_crt:
+            _apply_crt_patch(src_dir, apply=True)
+        # The CRT slider mask and the flame precision fix are separate: the mask
+        # exists to keep CRT readable in portrait, so a vanilla build leaves the
+        # shipped shader alone, while the flame fix is a GLSL ES precision bug
+        # that bites on iOS/Android GL whatever the layout is (#45, #46).
+        _apply_crt_slider_mask_patch(src_dir)
+    else:
+        # Not portrait work: without this the iOS drawable drops to point
+        # resolution at boot and the whole game is stretched and blurry (#45).
+        _apply_ios_highdpi_patch(src_dir)
     _apply_flame_precision_patch(src_dir)
     if apply_readabletro:
         _apply_readabletro(src_dir, apply=True)
@@ -760,7 +881,7 @@ def build_game_love(apply_crt=False, apply_readabletro=False, force=False, impor
 
     if not force and not changed:
         print("  No source changes - skipping rebuild.")
-        if apply_crt:
+        if portrait and apply_crt:
             _apply_crt_patch(src_dir, apply=False)
         if apply_readabletro:
             _apply_readabletro(src_dir, apply=False)
@@ -814,7 +935,7 @@ def build_game_love(apply_crt=False, apply_readabletro=False, force=False, impor
                     zf.writestr(f"install_mods/{modname}/{relpath}", data)
                     count += 1
 
-    if apply_crt:
+    if portrait and apply_crt:
         _apply_crt_patch(src_dir, apply=False)
     if apply_readabletro:
         _apply_readabletro(src_dir, apply=False)
@@ -1077,8 +1198,12 @@ def _patch_sdl_portrait_orientation(apk_out):
         f.write(smali)
 
 
-def build_apk(profiler=None):
-    """Download tools, package, and sign the always-Lovely Android APK."""
+def build_apk(profiler=None, portrait=True):
+    """Download tools, package, and sign the always-Lovely Android APK.
+
+    portrait=True locks the activity to portrait and forces SDL to match;
+    portrait=False leaves it landscape, which is how the game ships.
+    """
     game_love_src = os.path.abspath("Game.love")
     if not os.path.exists(game_love_src):
         print("  ERROR: Game.love not found - run the build step first.")
@@ -1130,15 +1255,21 @@ def build_apk(profiler=None):
         m = re.sub(r'android:versionCode="[^"]+"',   f'android:versionCode="{int(time.time())}"', m)
         m = re.sub(r'android:versionName="[^"]+"',   f'android:versionName="{MOD_VERSION}-lovely"', m)
         m = re.sub(r'\sandroid:debuggable="[^"]+"',  "",                                  m)
-        m = re.sub(r'android:screenOrientation="[^"]+"', 'android:screenOrientation="portrait"', m)
+        orientation = "portrait" if portrait else "landscape"
+        m = re.sub(r'android:screenOrientation="[^"]+"', f'android:screenOrientation="{orientation}"', m)
         m = re.sub(r'android:configChanges="[^"]+"',
                    'android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|navigation"', m)
         with open(manifest_path, "w") as f:
             f.write(m)
-        print("  [Lovely] Manifest patched.")
+        print(f"  [Lovely] Manifest patched (screenOrientation={orientation}).")
 
-        _patch_sdl_portrait_orientation(apk_out)
-        print("  [Lovely] SDL orientation patched.")
+        if portrait:
+            _patch_sdl_portrait_orientation(apk_out)
+            print("  [Lovely] SDL orientation patched.")
+        else:
+            # SDL's own orientation handling is what the game ships with; the
+            # portrait build overrides it, a vanilla build must not.
+            print("  [Lovely] SDL orientation left at SDL's default.")
 
         _patch_lovely_mod_dir(apk_out)
         print("  [Lovely] Mod folder repointed to save/game/Mods.")
@@ -1191,12 +1322,12 @@ def _ios_app_dir(zin):
     raise RuntimeError("no .app bundle found inside the base IPA")
 
 
-def build_ipa(profiler=None, lovely=True):
-    """Package Game.love into an unsigned, portrait-locked iOS .ipa.
+def build_ipa(profiler=None, lovely=True, portrait=True):
+    """Package Game.love into an unsigned iOS .ipa.
 
     The base is a prebuilt LOVE iOS app shell (no game data). We rewrite the
-    archive instead of appending so Info.plist can be replaced: orientation is
-    locked to portrait and the bundle version is set to MOD_VERSION. The IPA is
+    archive instead of appending so Info.plist can be replaced: orientation
+    follows `portrait` and the bundle version is set to MOD_VERSION. The IPA is
     unsigned by design — Sideloadly/AltStore re-sign it at install time.
 
     With lovely=True the shell is the one that has lovely-injector linked in, so
@@ -1239,7 +1370,8 @@ def build_ipa(profiler=None, lovely=True):
             print(f"  Icons: taking {len(icons)} from the Balatro shell.")
 
     with p.step("Pack IPA"):
-        print("  Packing IPA (portrait-locked Info.plist + game.love) ...")
+        print(f"  Packing IPA ({'portrait-locked' if portrait else 'landscape-locked'} "
+              f"Info.plist + game.love) ...")
         if os.path.exists(out_ipa):
             os.remove(out_ipa)
         with zipfile.ZipFile(base_ipa, "r") as zin, \
@@ -1253,8 +1385,16 @@ def build_ipa(profiler=None, lovely=True):
                 zout.writestr(item, icon if icon is not None else zin.read(item.filename))
 
             plist = plistlib.loads(zin.read(plist_arc))
-            plist["UISupportedInterfaceOrientations"] = ["UIInterfaceOrientationPortrait"]
-            plist["UISupportedInterfaceOrientations~ipad"] = ["UIInterfaceOrientationPortrait"]
+            if portrait:
+                orientations = ["UIInterfaceOrientationPortrait"]
+            else:
+                # The shell allows portrait as well; a vanilla build pins the
+                # two landscape modes so the shipped landscape layout is what
+                # the device shows.
+                orientations = ["UIInterfaceOrientationLandscapeLeft",
+                                "UIInterfaceOrientationLandscapeRight"]
+            plist["UISupportedInterfaceOrientations"] = orientations
+            plist["UISupportedInterfaceOrientations~ipad"] = orientations
             plist["CFBundleShortVersionString"] = MOD_VERSION
             plist["CFBundleVersion"] = MOD_VERSION
             # ProMotion iPhones hold an app to 60 Hz unless it says otherwise,
@@ -1279,12 +1419,13 @@ def build_ipa(profiler=None, lovely=True):
     size_mb = os.path.getsize(out_ipa) / 1_048_576
     print(f"\n{'=' * 60}")
     print("  iOS build complete - EXPERIMENTAL (untested by maintainer)")
-    print("  Mod loader: " + ("lovely (Steamodded can load)" if lovely else "none (vanilla)"))
+    print("  Mod loader: " + ("lovely (Steamodded can load)" if lovely else "none (plain LOVE shell)"))
+    print("  Layout:     " + ("portrait mod" if portrait else "as shipped (landscape)"))
     print(f"  IPA: {out_ipa}  ({size_mb:.2f} MB)")
     print(f"{'=' * 60}")
     print()
     print("  Sideload with Sideloadly or AltStore (signs with your Apple ID).")
-    print("  Lovely mod support is Android-only; the IPA is always vanilla.")
+    print("  Mods load through the lovely-injector built into the shell (see docs/IOS.md).")
     print("  See docs/IOS.md for instructions - and please report results!")
 
 
@@ -1315,19 +1456,33 @@ def _parse_args():
 
     ios = parser.add_mutually_exclusive_group()
     ios.add_argument("--ios",    dest="ios", action="store_true", default=None,
-                     help="also build an iOS .ipa for sideloading (EXPERIMENTAL)")
+                     help="build the iOS .ipa for sideloading (EXPERIMENTAL) and "
+                          "skip the Android APK")
     ios.add_argument("--no-ios", dest="ios", action="store_false",
                      help="skip the iOS build (default)")
 
     parser.add_argument("--ios-vanilla", dest="ios_vanilla", action="store_true",
                         help="build the iOS .ipa on the plain LOVE shell, without the mod loader")
 
+    portrait = parser.add_mutually_exclusive_group()
+    portrait.add_argument("--portrait", dest="portrait", action="store_true", default=None,
+                          help="package the portrait layout mod from src/")
+    portrait.add_argument("--no-portrait", dest="portrait", action="store_false",
+                          help="package the game as it ships, without the portrait layout "
+                               "mod (default)")
+
     parser.add_argument("--balatro", dest="balatro_path", metavar="PATH",
                         help="path to the Balatro game file (skips the interactive prompt)")
     parser.add_argument("--skip-setup", action="store_true",
                         help="skip resource extraction (if src/resources already exists)")
-    parser.add_argument("--skip-apk", action="store_true",
-                        help="only build Game.love, skip APK packaging")
+
+    # --ios is iOS-only, so an explicit APK choice has to be able to override
+    # it; --with-apk is what asks for both targets in one run.
+    apk = parser.add_mutually_exclusive_group()
+    apk.add_argument("--skip-apk", dest="skip_apk", action="store_true", default=None,
+                     help="only build Game.love, skip APK packaging (implied by --ios)")
+    apk.add_argument("--with-apk", dest="skip_apk", action="store_false",
+                     help="also package the Android APK when --ios is set")
     parser.add_argument("--force", action="store_true",
                         help="force Game.love rebuild even if sources are unchanged")
     parser.add_argument("--import-save", dest="import_save", metavar="PATH",
@@ -1413,6 +1568,8 @@ def main():
                 print(f"    Readabletro:                   {'yes' if config.get('readabletro') else 'no'}")
                 print("    Lovely mod support:            yes (always on for Android)")
                 print(f"    iOS .ipa (experimental):       {'yes' if config.get('ios') else 'no'}")
+                print(f"    Android APK:                   {'no (iOS-only; --with-apk for both)' if config.get('ios') else 'yes'}")
+                print(f"    Portrait layout mod:           {'yes (src/)' if config.get('portrait') else 'no (vanilla)'}")
                 print()
                 if not _ask("  Use these settings?", default=True):
                     config = {}
@@ -1436,10 +1593,20 @@ def main():
             config["readabletro"] = _ask("     Apply Readabletro?", default=DEFAULT_BUILD_CONFIG["readabletro"])
             print()
             print("  3. iOS Build (EXPERIMENTAL)")
-            print("     Also produces balatro-portrait.ipa for sideloading with")
-            print("     Sideloadly or AltStore. Untested by the maintainer -")
-            print("     feedback welcome. Lovely is not available on iOS.")
+            print("     Produces balatro-portrait.ipa for sideloading with")
+            print("     Sideloadly or AltStore. This is an iOS-only build: the")
+            print("     Android APK step is skipped, so no APK is written. Use")
+            print("     --with-apk from the command line to build both.")
+            print("     Untested by the maintainer - feedback welcome.")
             config["ios"] = _ask("     Build iOS .ipa?", default=DEFAULT_BUILD_CONFIG["ios"])
+            print()
+            print("  4. Portrait Layout Mod")
+            print("     No (default) packages the game as it ships: original landscape")
+            print("     layout, original HUD and controls. Yes applies the portrait")
+            print("     mod from src/ (vertical layout, swipe gestures, hand preview,")
+            print("     thumb-sized HUD). Only the mobile platform fixes that are not")
+            print("     about portrait stay in either way.")
+            config["portrait"] = _ask("     Apply the portrait layout mod?", default=DEFAULT_BUILD_CONFIG["portrait"])
             print()
             with open(CONFIG_FILE, "w") as f:
                 json.dump(config, f, indent=2)
@@ -1448,6 +1615,7 @@ def main():
     apply_crt         = cli.get("crt",          config.get("crt",         DEFAULT_BUILD_CONFIG["crt"]))
     apply_readabletro = cli.get("readabletro",   config.get("readabletro", DEFAULT_BUILD_CONFIG["readabletro"]))
     build_ios         = cli.get("ios",           config.get("ios",         DEFAULT_BUILD_CONFIG["ios"]))
+    build_portrait    = cli.get("portrait",      config.get("portrait",    DEFAULT_BUILD_CONFIG["portrait"]))
     balatro_path      = cli.get("balatro_path",  None)
     force             = cli.get("force",         False)
     import_saves      = _resolve_import_save(
@@ -1460,34 +1628,52 @@ def main():
     )
     import_mods       = dict([steamodded]) if steamodded else None
 
-    total = 4 if build_ios else 3
+    # --ios is an iOS-only build: the Android APK step is dropped unless the user
+    # asks for both targets with --with-apk. An explicit --skip-apk/--with-apk
+    # always wins over that default, so a plain `--no-ios` run is unchanged.
+    skip_apk = cli["skip_apk"] if "skip_apk" in cli else build_ios
+    total = 2 + (1 if build_ios else 0) + (0 if skip_apk else 1)
+    step = 0
 
     # ── Step 1 — Resources ──────────────────────────────────────────────────
-    needs_setup = not os.path.exists(os.path.join("src", "resources"))
+    step += 1
+    # Each mode has its own prerequisite: a portrait build packages src/, the
+    # default vanilla build packages game_original_files/ (the extraction). They
+    # are not interchangeable, so check for the tree this build will actually read.
+    if build_portrait:
+        needs_setup = not os.path.exists(os.path.join("src", "resources"))
+    else:
+        needs_setup = not os.path.exists(os.path.join("game_original_files", "resources"))
     print()
     if cli.get("skip_setup"):
-        print(f"[1/{total}] Skipping resource setup (--skip-setup).")
+        print(f"[{step}/{total}] Skipping resource setup (--skip-setup).")
     elif needs_setup:
-        print(f"[1/{total}] Game resources not found - extracting from Balatro.exe ...")
+        print(f"[{step}/{total}] Game resources not found - extracting from Balatro.exe ...")
         setup_resources(balatro_path)
     else:
-        print(f"[1/{total}] Resources already present.")
+        print(f"[{step}/{total}] Resources already present.")
 
     # ── Step 2 — Game.love ─────────────────────────────────────────────────
+    step += 1
     print()
-    print(f"[2/{total}] Building Game.love ...")
+    print(f"[{step}/{total}] Building Game.love "
+          f"({'portrait mod' if build_portrait else 'vanilla, no portrait mod'}) ...")
     build_game_love(apply_crt=apply_crt, apply_readabletro=apply_readabletro,
                     force=force or bool(import_saves) or bool(import_mods),
-                    import_saves=import_saves, import_mods=import_mods)
+                    import_saves=import_saves, import_mods=import_mods,
+                    portrait=build_portrait)
 
-    # ── Step 3 — APK ───────────────────────────────────────────────────────
-    if cli.get("skip_apk"):
+    # ── Step 3 — APK (dropped from an iOS-only run) ────────────────────────
+    if skip_apk:
         print()
-        print(f"[3/{total}] Skipping APK build (--skip-apk).")
+        print("  Android APK step skipped"
+              + (" (iOS-only build; --with-apk builds both)." if build_ios
+                 else " (--skip-apk)."))
     else:
+        step += 1
         print()
-        print(f"[3/{total}] Building APK ...")
-        build_apk(profiler=BuildProfiler())
+        print(f"[{step}/{total}] Building APK ...")
+        build_apk(profiler=BuildProfiler(), portrait=build_portrait)
 
         print()
         print("  Install on device:")
@@ -1495,9 +1681,11 @@ def main():
 
     # ── Step 4 — iOS IPA (experimental) ────────────────────────────────────
     if build_ios:
+        step += 1
         print()
-        print(f"[4/{total}] Building iOS IPA (experimental) ...")
-        build_ipa(profiler=BuildProfiler(), lovely=not cli.get("ios_vanilla"))
+        print(f"[{step}/{total}] Building iOS IPA (experimental) ...")
+        build_ipa(profiler=BuildProfiler(), lovely=not cli.get("ios_vanilla"),
+                  portrait=build_portrait)
 
 
 if __name__ == "__main__":

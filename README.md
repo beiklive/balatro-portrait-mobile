@@ -5,8 +5,14 @@
 
 A portrait-mode mod for Balatro on Android, built for one-handed play.
 
+> **The build does not apply the portrait mod by default.** As shipped, the build
+> packages the game as it is — original landscape layout, original HUD — into the
+> rootless APK and the iOS `.ipa`. Pass `--portrait` to build the portrait layout
+> mod described below. See [Portrait mod](#portrait-mod-opt-in).
+
 **Jump to:**
 [Which build should I use?](#which-build-should-i-use) ·
+[Portrait mod](#portrait-mod-opt-in) ·
 [Rootless APK](#rootless-apk-builder) ·
 [Termux](#phone-build-termux-no-pc) ·
 [Zygisk](#zygisk-module-experimental-root-only) ·
@@ -69,6 +75,48 @@ the Releases page.
 
 Every path needs a legal copy of Balatro. PC builds also need Python 3.6+;
 phone-only builds need Termux (F-Droid or GitHub build).
+
+## Portrait mod (opt in)
+
+`python build.py` packages the game as it ships. To get the portrait layout —
+vertical reflow, swipe gestures, hand preview, thumb-sized HUD — build with
+`--portrait`:
+
+```sh
+python build.py --portrait --ios
+```
+
+| | Default (`--no-portrait`) | `--portrait` |
+|---|---|---|
+| Source packaged | `game_original_files/` — your copy, as extracted | `src/` — the layout mod |
+| Orientation | landscape, as the game ships | locked portrait (`Info.plist`, `screenOrientation`) |
+| Layout, HUD, controls | untouched | portrait reflow, gestures, hand preview |
+| CRT shader | untouched | CRT disabled, edge mask follows the slider |
+| iOS native-scale drawable (#45) | kept | kept |
+| Android accelerometer gamepad (#44) | kept | kept |
+
+Both modes keep the edits that are not about portrait layout and that the game
+needs to behave on a phone at all — the iOS native-scale drawable fix (#45), the
+Android accelerometer-as-gamepad fix (#44) and the mod-loader boot screen fit
+(#44). The `conf.lua` ones live in `patches/mobile/`.
+
+The iOS native-scale fix needs a second half. `conf.lua` asks for the native
+scale, but the boot window rebuild in `functions/button_callbacks.lua` passes
+`highdpi = (love.system.getOS() == 'OS X')`, and `updateMode` takes whatever it
+is handed — so on iOS the flag is dropped again and the game renders at point
+resolution, stretched over the panel and blurry (#45). Because that file is
+mostly portrait work it cannot be overlaid wholesale, so `build.py` applies the
+one-line iOS arm instead (`_apply_ios_highdpi_patch`).
+
+Nothing in `src/` is removed either way, so `--portrait` still builds exactly
+what it did before.
+
+Only `conf.lua` is overlaid. The touch-cursor change in `src/engine/controller.lua`
+is not, even though it looks like a plain mobile fix: it only works together with
+the touch plumbing portrait adds to `src/main.lua`, which is what sets
+`G.CONTROLLER.touch_position.seen`. The shipped `main.lua` has no such field, so
+copying the change over leaves the game with a cursor parked offscreen that
+nothing ever moves — it renders, but no touch lands on anything.
 
 ## Rootless APK builder
 
@@ -139,6 +187,11 @@ More details: [zygisk/README.md](zygisk/README.md).
 Build with `--ios`, then sideload `balatro-portrait.ipa` with
 [Sideloadly](https://sideloadly.io/) or [AltStore](https://altstore.io/). Full
 guide: [docs/IOS.md](docs/IOS.md).
+
+`--ios` is an **iOS-only** build: the Android APK step is skipped, so no APK is
+written and none of the Android tooling (JDK, apktool, uber-apk-signer) is
+downloaded — Python 3.6+ and a network connection are all it needs. Pass
+`--with-apk` to package the APK in the same run.
 
 The notch / Dynamic Island inset (v2.6.4) and the home-indicator inset
 (v2.7.0) are read from the device at runtime, but this project is developed

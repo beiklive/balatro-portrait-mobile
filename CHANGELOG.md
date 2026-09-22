@@ -2,6 +2,42 @@
 
 All notable changes to Balatro Portrait Mobile.
 
+## Unreleased
+
+**`--ios` is an iOS-only build.** The Android APK step is no longer run as a side
+effect of asking for an IPA: `python build.py --ios` writes `balatro-portrait.ipa`
+and stops, so the Android JDK, apktool and uber-apk-signer downloads no longer
+happen and Python plus a network connection is enough. `--with-apk` packages both
+targets in one run, `--skip-apk` still means "Game.love only", and the step
+counter now matches the steps that actually run.
+
+**The portrait mod is opt-in.** Builds package the game as it ships unless
+`--portrait` is passed: the default source tree is `game_original_files/` (the
+copy extracted from your own game file) rather than the portrait-patched `src/`,
+the IPA's `Info.plist` declares the two landscape orientations instead of
+portrait, and the Android manifest is `screenOrientation="landscape"` with SDL's
+own orientation handling left alone. What survives in both modes is the set of
+edits that are not about portrait layout and that the game needs on a phone at
+all, kept in the new `patches/mobile/` overlay: the iOS native-scale drawable
+(#45), the Android accelerometer-as-gamepad fix (#44) and the mod-loader boot
+screen fit (#44). Nothing was deleted from `src/`, so `--portrait` produces
+exactly the build it did before.
+
+The iOS native-scale fix needs a second half that cannot live in the overlay.
+`conf.lua` asks for the native scale, but the boot window rebuild in
+`functions/button_callbacks.lua` passes `highdpi = (love.system.getOS() == 'OS X')`
+and `love.window.updateMode` honours exactly what it is handed, so on iOS the flag
+was dropped again: the drawable fell back to point resolution and the whole game
+was stretched over the panel and blurry. That file is mostly portrait work, so
+`build.py` now applies the one-line iOS arm itself
+(`_apply_ios_highdpi_patch`) instead of overlaying the file.
+
+`src/engine/controller.lua` is deliberately not part of the overlay. Its
+touch-cursor change reads and writes `G.CONTROLLER.touch_position`, which only
+the portrait tree's `src/main.lua` populates, so carrying it into a build without
+that plumbing leaves the cursor parked offscreen and the game unresponsive to
+touch.
+
 ## [v2.8.0](https://github.com/ShaggyLorean/balatro-portrait-mobile/releases/tag/v2.8.0) - 2026-09-15
 
 **The title screen corner buttons stay clear of the menu on narrow phones** (#48).

@@ -21,8 +21,9 @@ There is no Xcode and no macOS involved. The build:
    v2.7.7 used
 2. Inserts your locally built `Game.love` (made from **your** copy of Balatro)
    into `Payload/Balatro.app/`
-3. Locks `Info.plist` to portrait orientation, stamps the mod version and
-   opts the app into the panel's full refresh rate
+3. Sets the `Info.plist` orientation — landscape-locked by default,
+   portrait-locked with `--portrait` — stamps the mod version and opts the app
+   into the panel's full refresh rate
 4. Writes `balatro-portrait.ipa`
 
 Since v2.7.6 the window also asks for the screen's native scale. Without it
@@ -42,6 +43,35 @@ python build.py --ios
 
 Or answer **yes** to "Build iOS .ipa?" during the interactive build.
 The output is `balatro-portrait.ipa` in the project root.
+
+`--ios` builds **only** the IPA. The Android APK step is skipped, so no APK is
+written and none of the Android tooling (JDK, apktool, uber-apk-signer) is
+downloaded: Python 3.6+ and a network connection are all the build needs. Steps 1
+and 2 still run, because the IPA needs `Game.love` and the game resources it is
+packed from. Pass `--with-apk` if you want the APK packaged in the same run.
+
+### Portrait, or as shipped
+
+The build does **not** apply the portrait mod unless you ask for it, so
+`python build.py --ios` produces the game with its original landscape layout and
+the two landscape orientations declared in `Info.plist`. Add `--portrait` for the
+portrait mod, which pins `Info.plist` to portrait:
+
+```
+python build.py --ios --portrait
+```
+
+Either way the IPA keeps the mobile platform fixes that are not about portrait
+layout — the iOS native-scale drawable (#45), the Android accelerometer gamepad
+fix (#44) and the mod-loader boot screen fit (#44). The portrait-only shader work
+and the portrait layout are what `--portrait` adds.
+
+The native-scale fix has two halves. `conf.lua` asks for the native scale, but the
+game rebuilds its window once at boot in `functions/button_callbacks.lua` and only
+keeps the flag on macOS (`highdpi = (love.system.getOS() == 'OS X')`). iOS was
+missing from that test, so the drawable fell back to point size and the panel
+stretched it — a whole-screen blur. The build applies the iOS arm to that line;
+without it the IPA looks soft no matter what `conf.lua` says.
 
 ### Mods
 

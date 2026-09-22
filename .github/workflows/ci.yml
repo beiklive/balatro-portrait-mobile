@@ -66,7 +66,9 @@ jobs:
       - name: Smoke-test Game.love packaging
         run: |
           # No game files in CI (copyrighted) — packaging src/ alone is enough
-          # to catch path bugs and patch-target drift in build.py.
+          # to catch path bugs and patch-target drift in build.py. The default
+          # build packages game_original_files/, which CI cannot provide, so this
+          # step exercises the portrait tree explicitly with --portrait.
           mkdir -p src/resources/fonts src/resources/shaders src/localization
-          python build.py --keep-crt --no-readabletro --no-ios --skip-setup --skip-apk --force
+          python build.py --portrait --keep-crt --no-readabletro --no-ios --skip-setup --skip-apk --force
           test -f Game.love && unzip -l Game.love | tail -3
